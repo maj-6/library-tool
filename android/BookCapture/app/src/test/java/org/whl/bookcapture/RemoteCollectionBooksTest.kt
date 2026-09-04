@@ -82,6 +82,10 @@ class RemoteCollectionBooksTest {
         collectionId: String = boxA,
         digitizationCandidateClassification: Boolean? = null,
         scanPriorityRank: Int? = null,
+        scanPriorityAssessment: ScanPriorityAssessment? = null,
+        scanPriorityAssessmentKnown: Boolean = false,
+        scanPriorityRevision: Long = 0L,
+        scanPriorityUpdatedAt: String = "",
     ) =
         RemoteCollectionBook(
             captureId = id,
@@ -97,6 +101,10 @@ class RemoteCollectionBooksTest {
             createdAt = 100L,
             digitizationCandidateClassification = digitizationCandidateClassification,
             scanPriorityRank = scanPriorityRank,
+            scanPriorityAssessment = scanPriorityAssessment,
+            scanPriorityAssessmentKnown = scanPriorityAssessmentKnown,
+            scanPriorityRevision = scanPriorityRevision,
+            scanPriorityUpdatedAt = scanPriorityUpdatedAt,
         )
 
     private fun liveEntry(id: String): Entries.Entry = Entries.Entry(
@@ -629,6 +637,78 @@ class RemoteCollectionBooksTest {
     }
 
     @Test
+    fun newerRemoteAssessmentReplacesStaleLocalSnapshotIncludingExplicitClear() {
+        fun local(
+            priority: ScanPriorityAssessment?,
+            revision: Long,
+            updatedAt: String = "2026-07-24T00:00:00Z",
+        ) = CollectionInventoryItem(
+            summary = remoteBook(
+                "shared",
+                scanPriorityAssessment = priority,
+                scanPriorityAssessmentKnown = true,
+                scanPriorityRevision = revision,
+                scanPriorityUpdatedAt = updatedAt,
+            ).toInventoryItem().summary.copy(title = "Local title"),
+            current = liveEntry("shared"),
+            remote = false,
+        )
+        val medium = remoteBook(
+            "shared",
+            scanPriorityAssessment = ScanPriorityAssessment.MEDIUM,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 2L,
+            scanPriorityUpdatedAt = "2026-07-24T00:00:01Z",
+        ).toInventoryItem()
+
+        val updated = mergeCollectionBookItems(
+            listOf(local(ScanPriorityAssessment.HIGH, 1L), medium),
+        ).single()
+        assertFalse(updated.remote)
+        assertEquals("Local title", updated.summary.title)
+        assertEquals(ScanPriorityAssessment.MEDIUM, updated.summary.scanPriorityAssessment)
+        assertEquals(2L, updated.summary.scanPriorityRevision)
+
+        val clear = remoteBook(
+            "shared",
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 3L,
+            scanPriorityUpdatedAt = "2026-07-24T00:00:02Z",
+        ).toInventoryItem()
+        val cleared = mergeCollectionBookItems(
+            listOf(local(ScanPriorityAssessment.HIGH, 1L), clear),
+        ).single()
+        assertNull(cleared.summary.scanPriorityAssessment)
+        assertTrue(cleared.summary.scanPriorityAssessmentKnown)
+        assertEquals(3L, cleared.summary.scanPriorityRevision)
+    }
+
+    @Test
+    fun mergeUsesTimestampToRecognizeARecreatedPriorityLedger() {
+        val oldLocal = remoteBook(
+            "shared",
+            scanPriorityAssessment = ScanPriorityAssessment.HIGH,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 9L,
+            scanPriorityUpdatedAt = "2026-07-24T00:00:00Z",
+        ).toInventoryItem().copy(current = liveEntry("shared"), remote = false)
+        val resetRemote = remoteBook(
+            "shared",
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 1L,
+            scanPriorityUpdatedAt = "2026-07-24T00:01:00Z",
+        ).toInventoryItem()
+
+        val merged = mergeCollectionBookItems(listOf(oldLocal, resetRemote)).single()
+
+        assertFalse(merged.remote)
+        assertNull(merged.summary.scanPriorityAssessment)
+        assertTrue(merged.summary.scanPriorityAssessmentKnown)
+        assertEquals(1L, merged.summary.scanPriorityRevision)
+        assertEquals("2026-07-24T00:01:00Z", merged.summary.scanPriorityUpdatedAt)
+    }
+
+    @Test
     fun mergeKeepsDistinctBooksAndDropsIdlessRows() {
         val merged = mergeCollectionBookItems(
             listOf(
@@ -665,6 +745,10 @@ class RemoteCollectionBooksTest {
         includeBlock: Boolean = true,
         candidate: Boolean? = null,
         priority: Int? = null,
+        assessment: String? = null,
+        includeAssessment: Boolean = false,
+        revision: Long = 1L,
+        updatedAt: String = "2026-07-24T00:00:00+00:00",
     ): DesktopBookMetadata {
         val data = JSONObject()
             .put("schema", "org.whl.capture.desktop-book-metadata")
@@ -678,13 +762,14 @@ class RemoteCollectionBooksTest {
         }
         candidate?.let { data.put("digitization_candidate", it) }
         priority?.let { data.put("scan_priority_rank", it) }
+        if (includeAssessment) data.put("scan_priority", assessment ?: JSONObject.NULL)
         return desktopBookMetadataFromJson(
             JSONObject()
                 .put("capture_id", captureId)
                 .put("owner_id", owner1)
                 .put("book_id", "book-1")
-                .put("revision", 1L)
-                .put("updated_at", "2026-07-24T00:00:00+00:00")
+                .put("revision", revision)
+                .put("updated_at", updatedAt)
                 .put("data", data),
         )!!
     }
@@ -721,6 +806,37 @@ class RemoteCollectionBooksTest {
         assertEquals(false, cleared.digitizationCandidateClassification)
         assertFalse(cleared.digitizationCandidate)
         assertNull(cleared.scanPriorityRank)
+    }
+
+    @Test
+    fun enrichmentCarriesCanonicalAssessmentIndependentlyOfCandidate() {
+        val assigned = enrichRemoteCollectionBooks(
+            listOf(remoteBook(capA)),
+            mapOf(capA to desktopMetadata(
+                capA,
+                candidate = false,
+                assessment = "High",
+                includeAssessment = true,
+                revision = 9L,
+            )),
+        ).single()
+        assertEquals(ScanPriorityAssessment.HIGH, assigned.scanPriorityAssessment)
+        assertTrue(assigned.scanPriorityAssessmentKnown)
+        assertEquals(9L, assigned.scanPriorityRevision)
+        assertEquals("2026-07-24T00:00:00+00:00", assigned.scanPriorityUpdatedAt)
+        assertEquals(false, assigned.digitizationCandidateClassification)
+
+        val unassessed = enrichRemoteCollectionBooks(
+            listOf(assigned),
+            mapOf(capA to desktopMetadata(
+                capA,
+                includeAssessment = true,
+                revision = 10L,
+            )),
+        ).single()
+        assertNull(unassessed.scanPriorityAssessment)
+        assertTrue(unassessed.scanPriorityAssessmentKnown)
+        assertEquals(10L, unassessed.scanPriorityRevision)
     }
 
     @Test
@@ -803,6 +919,10 @@ class RemoteCollectionBooksTest {
             "one",
             digitizationCandidateClassification = true,
             scanPriorityRank = 4,
+            scanPriorityAssessment = ScanPriorityAssessment.MEDIUM,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 8L,
+            scanPriorityUpdatedAt = "2026-07-24T00:00:00Z",
         )
         assertTrue(RemoteCollectionBooks.record(target, owner1, boxA, listOf(expected)))
         val store = readRemoteCollectionBooksStore(target, owner1)
@@ -812,7 +932,150 @@ class RemoteCollectionBooksTest {
         val row = JSONObject(target.readText())
             .getJSONObject("collections").getJSONArray(boxA).getJSONObject(0)
         assertEquals(4, row.getInt("scan_priority_rank"))
-        assertFalse(row.has("scan_priority"))
+        assertEquals("Medium", row.getString("scan_priority"))
+        assertTrue(row.getBoolean("scan_priority_known"))
+        assertEquals(8L, row.getLong("scan_priority_revision"))
+        assertEquals("2026-07-24T00:00:00Z", row.getString("scan_priority_updated_at"))
+    }
+
+    @Test
+    fun failedMetadataLookupRetainsCachedAssessmentAndNewerExplicitClearWins() {
+        val target = tempFile()
+        val assigned = remoteBook(
+            capA,
+            scanPriorityAssessment = ScanPriorityAssessment.HIGH,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 5L,
+            scanPriorityUpdatedAt = "2026-07-24T00:00:00Z",
+        )
+        assertTrue(RemoteCollectionBooks.record(target, owner1, boxA, listOf(assigned)))
+
+        assertTrue(RemoteCollectionBooks.record(target, owner1, boxA, listOf(remoteBook(capA))))
+        val retained = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.getValue(boxA).single()
+        assertEquals(ScanPriorityAssessment.HIGH, retained.scanPriorityAssessment)
+        assertTrue(retained.scanPriorityAssessmentKnown)
+        assertEquals(5L, retained.scanPriorityRevision)
+        assertEquals("2026-07-24T00:00:00Z", retained.scanPriorityUpdatedAt)
+
+        val cleared = remoteBook(
+            capA,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 6L,
+            scanPriorityUpdatedAt = "2026-07-24T00:01:00Z",
+        )
+        assertTrue(RemoteCollectionBooks.record(target, owner1, boxA, listOf(cleared)))
+        val current = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.getValue(boxA).single()
+        assertNull(current.scanPriorityAssessment)
+        assertTrue(current.scanPriorityAssessmentKnown)
+        assertEquals(6L, current.scanPriorityRevision)
+        assertEquals("2026-07-24T00:01:00Z", current.scanPriorityUpdatedAt)
+    }
+
+    @Test
+    fun newerTimestampAllowsARecreatedLowerRevisionLedgerToClearCachedPriority() {
+        val target = tempFile()
+        val assigned = remoteBook(
+            capA,
+            scanPriorityAssessment = ScanPriorityAssessment.HIGH,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 9L,
+            scanPriorityUpdatedAt = "2026-07-24T00:00:00Z",
+        )
+        assertTrue(RemoteCollectionBooks.record(target, owner1, boxA, listOf(assigned)))
+
+        val recreated = remoteBook(
+            capA,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 1L,
+            scanPriorityUpdatedAt = "2026-07-24T00:01:00Z",
+        )
+        assertTrue(RemoteCollectionBooks.record(target, owner1, boxA, listOf(recreated)))
+
+        val current = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.getValue(boxA).single()
+        assertNull(current.scanPriorityAssessment)
+        assertEquals(1L, current.scanPriorityRevision)
+        assertEquals("2026-07-24T00:01:00Z", current.scanPriorityUpdatedAt)
+    }
+
+    @Test
+    fun cachedCopiesSelectTheNewerLedgerResetBeforeRetainingAfterFailedLookup() {
+        val target = tempFile()
+        val oldLedger = remoteBook(
+            capA,
+            collectionId = boxA,
+            scanPriorityAssessment = ScanPriorityAssessment.HIGH,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 9L,
+            scanPriorityUpdatedAt = "2026-07-24T00:00:00Z",
+        )
+        val resetLedger = remoteBook(
+            capA,
+            collectionId = boxB,
+            scanPriorityAssessment = ScanPriorityAssessment.LOW,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 1L,
+            scanPriorityUpdatedAt = "2026-07-24T00:01:00Z",
+        )
+        assertTrue(RemoteCollectionBooks.record(target, owner1, boxA, listOf(oldLedger)))
+        assertTrue(RemoteCollectionBooks.record(target, owner1, boxB, listOf(resetLedger)))
+
+        assertTrue(RemoteCollectionBooks.record(
+            target,
+            owner1,
+            boxC,
+            listOf(remoteBook(capA, collectionId = boxC)),
+        ))
+        val retained = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.getValue(boxC).single()
+        assertEquals(ScanPriorityAssessment.LOW, retained.scanPriorityAssessment)
+        assertEquals(1L, retained.scanPriorityRevision)
+        assertEquals("2026-07-24T00:01:00Z", retained.scanPriorityUpdatedAt)
+    }
+
+    @Test
+    fun cachedCopiesSelectTheNewerLedgerResetRegardlessOfCollectionOrder() {
+        val target = tempFile()
+        val resetLedger = remoteBook(
+            capA,
+            collectionId = boxA,
+            scanPriorityAssessment = ScanPriorityAssessment.LOW,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 1L,
+            scanPriorityUpdatedAt = "2026-07-24T00:01:00Z",
+        )
+        val oldLedger = remoteBook(
+            capA,
+            collectionId = boxB,
+            scanPriorityAssessment = ScanPriorityAssessment.HIGH,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 9L,
+            scanPriorityUpdatedAt = "2026-07-24T00:00:00Z",
+        )
+        assertTrue(saveRemoteCollectionBooksStore(
+            target,
+            RemoteCollectionBooksStore(
+                byCollection = mapOf(
+                    boxA to listOf(resetLedger),
+                    boxB to listOf(oldLedger),
+                ),
+                owner = owner1,
+            ),
+        ))
+
+        assertTrue(RemoteCollectionBooks.record(
+            target,
+            owner1,
+            boxC,
+            listOf(remoteBook(capA, collectionId = boxC)),
+        ))
+        val retained = readRemoteCollectionBooksStore(target, owner1)
+            .byCollection.getValue(boxC).single()
+        assertEquals(ScanPriorityAssessment.LOW, retained.scanPriorityAssessment)
+        assertEquals(1L, retained.scanPriorityRevision)
+        assertEquals("2026-07-24T00:01:00Z", retained.scanPriorityUpdatedAt)
     }
 
     @Test
@@ -908,6 +1171,32 @@ class RemoteCollectionBooksTest {
         assertNull(book.digitizationCandidateClassification)
         assertFalse(book.digitizationCandidate)
         assertNull(book.scanPriorityRank)
+    }
+
+    @Test
+    fun versionFivePriorityCacheMigratesWithAnUnknownTimestamp() {
+        val root = JSONObject(remoteCollectionBooksStoreToJson(
+            RemoteCollectionBooksStore(
+                byCollection = mapOf(boxA to listOf(remoteBook(
+                    capA,
+                    scanPriorityAssessment = ScanPriorityAssessment.MEDIUM,
+                    scanPriorityAssessmentKnown = true,
+                    scanPriorityRevision = 7L,
+                    scanPriorityUpdatedAt = "2026-07-24T00:00:00Z",
+                ))),
+                owner = owner1,
+            ),
+        )).put("version", 5)
+        root.getJSONObject("collections").getJSONArray(boxA).getJSONObject(0)
+            .remove("scan_priority_updated_at")
+
+        val parsed = remoteCollectionBooksStoreFromJson(root.toString())
+        val book = parsed.byCollection.getValue(boxA).single()
+
+        assertTrue(parsed.valid)
+        assertEquals(ScanPriorityAssessment.MEDIUM, book.scanPriorityAssessment)
+        assertEquals(7L, book.scanPriorityRevision)
+        assertEquals("", book.scanPriorityUpdatedAt)
     }
 
     @Test

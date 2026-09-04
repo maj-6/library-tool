@@ -88,6 +88,8 @@ class EntryDetailActivity : AppCompatActivity() {
                 ProcessWorker.workNameForEntry(entryId),
                 CaptureMetadataSyncWorker.WORK_NAME,
                 CaptureMetadataSyncWorker.PULL_WORK_NAME,
+                CaptureMetadataSyncWorker.LAN_WORK_NAME,
+                CaptureMetadataSyncWorker.LAN_PULL_WORK_NAME,
             ))
             .observe(this) { scheduleWorkerRefresh() }
     }
@@ -146,6 +148,7 @@ class EntryDetailActivity : AppCompatActivity() {
             bookView = binding.detailBookSummary,
             candidate = entryScanCandidate(this, entry),
             rank = entry.desktopBook?.scanPriorityRank,
+            assessment = entry.desktopBook?.scanPriorityAssessment,
         )
 
         val libMarker = captureLibMarkerPresentation(
@@ -206,7 +209,17 @@ class EntryDetailActivity : AppCompatActivity() {
     }
 
     private fun desktopDetailFields(entry: Entries.Entry): List<BookDetailField> {
-        val desktop = entry.desktopBook ?: return emptyList()
+        val desktop = entry.desktopBook
+        val scanPriority = BookDetailField(
+            getString(R.string.detail_scan_priority),
+            scanPriorityDetailValue(
+                assessment = desktop?.scanPriorityAssessment,
+                assessmentKnown = desktop?.scanPriorityAssessmentKnown == true,
+                unassessedLabel = getString(R.string.scan_priority_assessment_unassessed),
+                unavailableLabel = getString(R.string.scan_priority_assessment_unavailable),
+            ),
+        )
+        if (desktop == null) return listOf(scanPriority)
         val fields = mutableListOf<BookDetailField>()
         val copyright = desktop.copyright
         if (desktop.registered || copyright.status.isNotBlank()) {
@@ -236,16 +249,15 @@ class EntryDetailActivity : AppCompatActivity() {
             getString(R.string.detail_ia_availability),
             desktopAvailabilityText(desktop.internetArchive),
         )
+        fields += scanPriority
         if (entryScanCandidate(this, entry) == true) {
-            val digitization = scanPriorityPresentation(
-                candidate = true,
-                rank = desktop.scanPriorityRank,
-                candidateLabel = getString(R.string.home_digitization_candidate),
-                rankLabel = { rank ->
-                    getString(R.string.scan_priority_description, rank)
-                },
-                rankUnsetLabel = getString(R.string.scan_priority_unset),
-            ).accessibilityLabel
+            val digitization = desktop.scanPriorityRank
+                ?.takeIf { it in 1..5 }
+                ?.let { getString(R.string.scan_priority_description, it) }
+                ?: listOf(
+                    getString(R.string.home_digitization_candidate),
+                    getString(R.string.scan_priority_unset),
+                ).joinToString(". ")
             fields += BookDetailField(
                 getString(R.string.detail_digitization),
                 digitization,

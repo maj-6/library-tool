@@ -3,6 +3,26 @@
 Android releases are listed newest first. Prerelease entries describe builds
 intended for testing before a stable release.
 
+## 0.5.2-alpha.21 — 2026-09-03
+
+Android version code: `52`.
+
+### Additions
+
+- Desktop scan assessments now appear consistently on Home, every Inspect
+  layout, Archive, book details, and the last-captured preview. `N/S` is an
+  explicit no-scan assessment; an unassessed book has no assessment badge.
+
+### Other Changes
+
+- Archive and camera views refresh when desktop book metadata changes. Archive
+  refreshes use bounded, cadenced windows and remain metadata-only.
+
+### Bugfixes
+
+- Metadata projection preserves an explicit unassessed state and ignores
+  malformed scan-assessment values, preventing stale or erased badges.
+
 ## 0.5.2-alpha.20 — 2026-08-26
 
 Android version code: `51`.

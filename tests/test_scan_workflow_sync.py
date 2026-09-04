@@ -697,7 +697,7 @@ def test_collection_type_is_created_returned_and_immutable(client, monkeypatch):
     assert len(calls) == 1
 
 
-def test_active_scan_state_projects_candidate_and_keeps_priority():
+def test_active_scan_state_projects_candidate_and_migrates_legacy_rank():
     rows = server._capture_book_metadata_rows(
         builds={"book-1": {
             "capture_id": CAPTURE_ID,
@@ -710,7 +710,8 @@ def test_active_scan_state_projects_candidate_and_keeps_priority():
     )
     data = rows[0]["data"]
     assert data["digitization_candidate"] is True
-    assert data["scan_priority"] == "4"
+    assert "scan_priority" not in data
+    assert data["scan_priority_rank"] == 4
     assert data["projection_source"]["scan_state_updated_at"] == \
         server._capture_projection_stamp(STAMP)
     assert supabase_sync._projection_vector(data)["scan_state_updated_at"] is not None

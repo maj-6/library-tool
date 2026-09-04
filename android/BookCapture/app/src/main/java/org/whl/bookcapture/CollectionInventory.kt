@@ -29,6 +29,14 @@ internal data class CollectionInventorySummary(
     val digitizationCandidateClassification: Boolean? = null,
     /** Present only for an explicitly classified candidate; valid values are 1..5. */
     val scanPriorityRank: Int? = null,
+    /** Canonical catalog scan assessment; null can mean Unassessed or legacy-unknown. */
+    val scanPriorityAssessment: ScanPriorityAssessment? = null,
+    /** Distinguishes an authoritative Unassessed value from an old cache row. */
+    val scanPriorityAssessmentKnown: Boolean = false,
+    /** Desktop metadata revision that supplied the assessment. */
+    val scanPriorityRevision: Long = 0L,
+    /** Server timestamp paired with [scanPriorityRevision]; blank for legacy/unknown rows. */
+    val scanPriorityUpdatedAt: String = "",
     /** Effective collection role. Legacy rows are ordinary capture records. */
     val collectionType: CollectionType = CollectionType.CAPTURE,
     /** Active physical set-aside for digitization, independent of OCR/photo capture. */
@@ -64,7 +72,7 @@ internal data class CollectionInventoryStore(
 )
 
 internal const val COLLECTION_INVENTORY_FILE = "collection_inventory.json"
-internal const val COLLECTION_INVENTORY_VERSION = 5
+internal const val COLLECTION_INVENTORY_VERSION = 7
 
 internal object CollectionInventory {
 
@@ -121,6 +129,18 @@ internal fun collectionInventorySummary(entry: Entries.Entry): CollectionInvento
         cloudOwnerId = entry.cloudOwnerId.trim().lowercase(),
         digitizationCandidateClassification = desktop?.digitizationCandidateClassification,
         scanPriorityRank = desktop?.scanPriorityRank,
+        scanPriorityAssessment = desktop?.scanPriorityAssessment,
+        scanPriorityAssessmentKnown = desktop?.scanPriorityAssessmentKnown == true,
+        scanPriorityRevision = if (desktop?.scanPriorityAssessmentKnown == true) {
+            desktop.revision
+        } else {
+            0L
+        },
+        scanPriorityUpdatedAt = if (desktop?.scanPriorityAssessmentKnown == true) {
+            desktop.updatedAt
+        } else {
+            ""
+        },
         collectionType = if (scanMark == null) {
             CollectionType.CAPTURE
         } else {
@@ -177,6 +197,10 @@ internal fun collectionInventoryStoreToJson(store: CollectionInventoryStore): St
  * rank. Current writers use `scan_priority_rank`; readers retain a numeric-only
  * fallback for older rows written with the former `scan_priority` key.
  * Version 5 retains collection role plus the independent physical scan mark.
+ * Version 6 retains the canonical textual scan assessment, its authoritative
+ * presence flag, and the desktop revision that supplied it.
+ * Version 7 adds the paired server timestamp so a recreated revision ledger
+ * can supersede an older, numerically higher revision.
  */
 internal fun collectionInventoryStoreFromJson(text: String): CollectionInventoryStore = try {
     val root = JSONObject(text)
@@ -248,6 +272,19 @@ private fun summaryToJson(summary: CollectionInventorySummary): JSONObject {
             (summary.digitizationCandidateClassification == true &&
                 summary.scanPriorityRank in 1..5),
     ) { "scan priority rank requires an explicit candidate and must be in 1..5" }
+    require(summary.scanPriorityAssessment == null || summary.scanPriorityAssessmentKnown) {
+        "scan priority assessment requires an authoritative projection"
+    }
+    require(summary.scanPriorityRevision >= 0L) { "scan priority revision must not be negative" }
+    require(summary.scanPriorityAssessmentKnown || summary.scanPriorityRevision == 0L) {
+        "unknown scan priority cannot carry a revision"
+    }
+    require(summary.scanPriorityUpdatedAt.length <= 80) {
+        "scan priority timestamp is too long"
+    }
+    require(summary.scanPriorityAssessmentKnown || summary.scanPriorityUpdatedAt.isEmpty()) {
+        "unknown scan priority cannot carry a timestamp"
+    }
     require(summary.scanRevision >= 0L) { "scan revision must not be negative" }
     require(!summary.scanMarked ||
         (summary.collectionType == CollectionType.SCAN &&
@@ -269,6 +306,13 @@ private fun summaryToJson(summary: CollectionInventorySummary): JSONObject {
             summary.digitizationCandidateClassification ?: JSONObject.NULL,
         )
         .put("scan_priority_rank", summary.scanPriorityRank ?: JSONObject.NULL)
+        .put(
+            "scan_priority",
+            summary.scanPriorityAssessment?.wireValue ?: JSONObject.NULL,
+        )
+        .put("scan_priority_known", summary.scanPriorityAssessmentKnown)
+        .put("scan_priority_revision", summary.scanPriorityRevision)
+        .put("scan_priority_updated_at", summary.scanPriorityUpdatedAt)
         .put("collection_type", summary.collectionType.wireValue)
         .put("scan_marked", summary.scanMarked)
         .put("scan_source_collection_id", summary.scanSourceCollectionId)
@@ -306,6 +350,27 @@ private fun summaryFromJson(
     val scanPriorityRank = if (version < 4) null else {
         optionalInventoryPriorityRank(row, digitizationCandidateClassification)
     }
+    val scanPriorityAssessmentKnown = if (version < 6) false else {
+        optionalInventoryBoolean(row, "scan_priority_known")
+            ?: throw IllegalArgumentException("scan_priority_known must be a boolean")
+    }
+    val scanPriorityAssessment = if (version < 6 || !scanPriorityAssessmentKnown) null else {
+        optionalInventoryPriorityAssessment(row)
+    }
+    val scanPriorityRevision = if (version < 6) 0L else {
+        requiredWholeNumber(row, "scan_priority_revision")
+    }
+    require(scanPriorityRevision >= 0L) { "invalid scan priority revision" }
+    require(scanPriorityAssessmentKnown || scanPriorityRevision == 0L) {
+        "unknown scan priority cannot carry a revision"
+    }
+    val scanPriorityUpdatedAt = if (version < 7) "" else {
+        requiredString(row, "scan_priority_updated_at")
+    }
+    require(scanPriorityUpdatedAt.length <= 80) { "invalid scan priority timestamp" }
+    require(scanPriorityAssessmentKnown || scanPriorityUpdatedAt.isEmpty()) {
+        "unknown scan priority cannot carry a timestamp"
+    }
     val collectionType = if (version < 5) CollectionType.CAPTURE else {
         CollectionType.fromWire(requiredString(row, "collection_type"))
             ?: throw IllegalArgumentException("invalid collection type")
@@ -342,6 +407,10 @@ private fun summaryFromJson(
         cloudOwnerId = cloudOwnerId,
         digitizationCandidateClassification = digitizationCandidateClassification,
         scanPriorityRank = scanPriorityRank,
+        scanPriorityAssessment = scanPriorityAssessment,
+        scanPriorityAssessmentKnown = scanPriorityAssessmentKnown,
+        scanPriorityRevision = scanPriorityRevision,
+        scanPriorityUpdatedAt = scanPriorityUpdatedAt,
         collectionType = collectionType,
         scanMarked = scanMarked,
         scanSourceCollectionId = scanSourceCollectionId,
@@ -356,6 +425,15 @@ private fun optionalInventoryBoolean(source: JSONObject, name: String): Boolean?
         is Boolean -> raw
         else -> throw IllegalArgumentException("$name must be a boolean or null")
     }
+
+private fun optionalInventoryPriorityAssessment(source: JSONObject): ScanPriorityAssessment? {
+    val raw = source.opt("scan_priority")
+    if (raw == null || raw === JSONObject.NULL) return null
+    val value = raw as? String
+        ?: throw IllegalArgumentException("scan_priority must be a string or null")
+    return ScanPriorityAssessment.parse(value)
+        ?: throw IllegalArgumentException("invalid scan_priority")
+}
 
 private fun optionalInventoryPriorityRank(
     source: JSONObject,

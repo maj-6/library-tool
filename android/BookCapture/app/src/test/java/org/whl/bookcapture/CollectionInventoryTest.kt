@@ -19,6 +19,9 @@ class CollectionInventoryTest {
         createdAt: Long = 100L,
         digitizationCandidateClassification: Boolean? = null,
         scanPriorityRank: Int? = null,
+        scanPriorityAssessment: ScanPriorityAssessment? = null,
+        scanPriorityAssessmentKnown: Boolean = false,
+        scanPriorityRevision: Long = 0L,
     ) = CollectionInventorySummary(
         entryId = id,
         collectionId = "00000000-0000-0000-0000-000000000001",
@@ -30,6 +33,9 @@ class CollectionInventoryTest {
         createdAt = createdAt,
         digitizationCandidateClassification = digitizationCandidateClassification,
         scanPriorityRank = scanPriorityRank,
+        scanPriorityAssessment = scanPriorityAssessment,
+        scanPriorityAssessmentKnown = scanPriorityAssessmentKnown,
+        scanPriorityRevision = scanPriorityRevision,
     )
 
     private fun entry(
@@ -75,15 +81,19 @@ class CollectionInventoryTest {
         captureId: String,
         candidate: Boolean,
         priority: Int? = null,
+        assessment: String? = null,
+        includeAssessment: Boolean = false,
+        revision: Long = 1L,
     ): DesktopBookMetadata {
         val data = JSONObject().put("digitization_candidate", candidate)
         priority?.let { data.put("scan_priority_rank", it) }
+        if (includeAssessment) data.put("scan_priority", assessment ?: JSONObject.NULL)
         return desktopBookMetadataFromJson(
             JSONObject()
                 .put("capture_id", captureId)
                 .put("owner_id", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
                 .put("book_id", "manual:book-1")
-                .put("revision", 1L)
+                .put("revision", revision)
                 .put("updated_at", "2026-08-21T12:00:00Z")
                 .put("data", data),
         )!!
@@ -95,6 +105,9 @@ class CollectionInventoryTest {
             "entry-1",
             digitizationCandidateClassification = true,
             scanPriorityRank = 3,
+            scanPriorityAssessment = ScanPriorityAssessment.HIGH,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 7L,
         )
         val encoded = collectionInventoryStoreToJson(
             CollectionInventoryStore(mapOf(original.entryId to original)),
@@ -110,7 +123,9 @@ class CollectionInventoryTest {
         assertEquals("", row.getString("cloud_owner_id"))
         assertTrue(row.getBoolean("digitization_candidate"))
         assertEquals(3, row.getInt("scan_priority_rank"))
-        assertFalse(row.has("scan_priority"))
+        assertEquals("High", row.getString("scan_priority"))
+        assertTrue(row.getBoolean("scan_priority_known"))
+        assertEquals(7L, row.getLong("scan_priority_revision"))
         assertEquals("capture", row.getString("collection_type"))
         assertFalse(row.getBoolean("scan_marked"))
         assertEquals(0L, row.getLong("scan_revision"))
@@ -196,7 +211,7 @@ class CollectionInventoryTest {
     fun malformedOrUnknownSchemasAreNotWritableStores() {
         val invalid = listOf(
             "{}",
-            """{"version":6,"entries":{}}""",
+            """{"version":${COLLECTION_INVENTORY_VERSION + 1},"entries":{}}""",
             """{"version":1,"entries":[]}""",
             """{"version":1,"entries":{"e":{"collection_id":4}}}""",
             """{"version":1,"entries":{"e":{
@@ -283,11 +298,40 @@ class CollectionInventoryTest {
 
         assertFalse(row.getBoolean("digitization_candidate"))
         assertTrue(row.isNull("scan_priority_rank"))
-        assertFalse(row.has("scan_priority"))
+        assertTrue(row.isNull("scan_priority"))
+        assertFalse(row.getBoolean("scan_priority_known"))
+        assertEquals(0L, row.getLong("scan_priority_revision"))
         assertEquals(
             cleared,
             collectionInventoryStoreFromJson(encoded).summaries.getValue("entry-1"),
         )
+    }
+
+    @Test
+    fun canonicalScanPriorityAndExplicitUnassessedRoundTripIndependentlyOfCandidate() {
+        val assigned = summary(
+            "assigned",
+            digitizationCandidateClassification = false,
+            scanPriorityAssessment = ScanPriorityAssessment.NO_SCAN,
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 11L,
+        )
+        val unassessed = summary(
+            "unassessed",
+            scanPriorityAssessmentKnown = true,
+            scanPriorityRevision = 12L,
+        )
+        val encoded = collectionInventoryStoreToJson(CollectionInventoryStore(
+            mapOf(assigned.entryId to assigned, unassessed.entryId to unassessed),
+        ))
+        val decoded = collectionInventoryStoreFromJson(encoded)
+
+        assertEquals(assigned, decoded.summaries.getValue("assigned"))
+        assertEquals(unassessed, decoded.summaries.getValue("unassessed"))
+        val rows = JSONObject(encoded).getJSONObject("entries")
+        assertEquals("n/s (no scan)", rows.getJSONObject("assigned").getString("scan_priority"))
+        assertTrue(rows.getJSONObject("unassessed").isNull("scan_priority"))
+        assertTrue(rows.getJSONObject("unassessed").getBoolean("scan_priority_known"))
     }
 
     @Test
@@ -437,12 +481,22 @@ class CollectionInventoryTest {
         val candidate = collectionInventorySummary(
             entry(
                 captureId,
-                desktopBook = desktopMetadata(captureId, candidate = true, priority = 5),
+                desktopBook = desktopMetadata(
+                    captureId,
+                    candidate = true,
+                    priority = 5,
+                    assessment = "Medium",
+                    includeAssessment = true,
+                    revision = 4L,
+                ),
             ),
         )
         assertEquals(true, candidate.digitizationCandidateClassification)
         assertTrue(candidate.digitizationCandidate)
         assertEquals(5, candidate.scanPriorityRank)
+        assertEquals(ScanPriorityAssessment.MEDIUM, candidate.scanPriorityAssessment)
+        assertTrue(candidate.scanPriorityAssessmentKnown)
+        assertEquals(4L, candidate.scanPriorityRevision)
 
         val cleared = collectionInventorySummary(
             entry(

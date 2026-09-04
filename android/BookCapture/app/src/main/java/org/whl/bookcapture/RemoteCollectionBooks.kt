@@ -43,6 +43,14 @@ internal data class RemoteCollectionBook(
     val digitizationCandidateClassification: Boolean? = null,
     /** Present only for an explicitly classified candidate; valid values are 1..5. */
     val scanPriorityRank: Int? = null,
+    /** Canonical catalog scan assessment; null can mean Unassessed or legacy-unknown. */
+    val scanPriorityAssessment: ScanPriorityAssessment? = null,
+    /** Distinguishes an authoritative Unassessed value from an old/cache-miss value. */
+    val scanPriorityAssessmentKnown: Boolean = false,
+    /** Desktop metadata revision that supplied the assessment. */
+    val scanPriorityRevision: Long = 0L,
+    /** Server timestamp paired with [scanPriorityRevision]; blank for legacy/unknown rows. */
+    val scanPriorityUpdatedAt: String = "",
     /** Effective destination role projected by the inventory view. */
     val collectionType: CollectionType = CollectionType.CAPTURE,
     /** True while this physical book is set aside for digitization. */
@@ -73,7 +81,7 @@ internal data class RemoteCollectionRecordResult(
 )
 
 internal const val REMOTE_COLLECTION_BOOKS_FILE = "remote_collection_books.json"
-internal const val REMOTE_COLLECTION_BOOKS_VERSION = 4
+internal const val REMOTE_COLLECTION_BOOKS_VERSION = 6
 
 /** Per-request page size. PostgREST may return fewer rows; an empty page, not a
  * short one, is the only end-of-snapshot signal. */
@@ -246,7 +254,22 @@ internal object RemoteCollectionBooks {
             .map { it.trim().lowercase() }
             .filter(String::isNotEmpty)
             .toSet()
-        val returned = books.mapTo(linkedSetOf()) { it.captureId.lowercase() }
+        val cachedPriorityById = stored.byCollection.values.asSequence()
+            .flatten()
+            .filter { it.scanPriorityAssessmentKnown }
+            .groupBy { it.captureId.lowercase() }
+            .mapValues { (_, copies) ->
+                copies.reduce { selected, candidate ->
+                    if (scanPrioritySupersedes(candidate, selected)) candidate else selected
+                }
+            }
+        val booksWithRetainedPriority = books.map { incoming ->
+            cachedPriorityById[incoming.captureId.lowercase()]?.let { cached ->
+                retainNewerScanPriority(incoming, cached)
+            } ?: incoming
+        }
+        val returned = booksWithRetainedPriority
+            .mapTo(linkedSetOf()) { it.captureId.lowercase() }
         val stale = if (queried.isEmpty()) emptySet() else {
             stored.byCollection.values.asSequence()
                 .flatten()
@@ -287,7 +310,7 @@ internal object RemoteCollectionBooks {
         // Keep one synthetic representative even when the queried key is being
         // replaced with an empty response; otherwise a local durable summary
         // falls back to frozen provenance and resurrects the moved book.
-        updated[collectionId] = books + staleRepresentatives.values + departed
+        updated[collectionId] = booksWithRetainedPriority + staleRepresentatives.values + departed
         val result = RemoteCollectionRecordResult(returned + stale)
         if (target.isFile && stored.owner == owner &&
             updated == stored.byCollection
@@ -515,6 +538,14 @@ internal fun enrichRemoteCollectionBooks(
         year = book.year.ifEmpty { projected.year },
         digitizationCandidateClassification = metadata.digitizationCandidateClassification,
         scanPriorityRank = metadata.scanPriorityRank,
+        scanPriorityAssessment = metadata.scanPriorityAssessment,
+        scanPriorityAssessmentKnown = metadata.scanPriorityAssessmentKnown,
+        scanPriorityRevision = metadata.revision
+            .takeIf { metadata.scanPriorityAssessmentKnown }
+            ?: 0L,
+        scanPriorityUpdatedAt = metadata.updatedAt
+            .takeIf { metadata.scanPriorityAssessmentKnown }
+            .orEmpty(),
     )
 }
 
@@ -535,6 +566,10 @@ internal fun RemoteCollectionBook.toInventoryItem(): CollectionInventoryItem =
             deliveryTransport = "cloud",
             digitizationCandidateClassification = digitizationCandidateClassification,
             scanPriorityRank = scanPriorityRank,
+            scanPriorityAssessment = scanPriorityAssessment,
+            scanPriorityAssessmentKnown = scanPriorityAssessmentKnown,
+            scanPriorityRevision = scanPriorityRevision,
+            scanPriorityUpdatedAt = scanPriorityUpdatedAt,
             collectionType = collectionType,
             scanMarked = scanMarked,
             scanSourceCollectionId = scanSourceCollectionId,
@@ -593,12 +628,26 @@ private fun fillUnknownScanMetadata(
         (fallbackScan.scanRevision == preferredScan.scanRevision &&
             !preferredScan.scanMarked && fallbackScan.scanMarked)
     val selectedScan = if (useFallbackScan) fallbackScan else preferredScan
+    val prioritySource = when {
+        !preferredScan.scanPriorityAssessmentKnown -> fallbackScan
+        fallbackScan.scanPriorityAssessmentKnown && scanPriorityVersionSupersedes(
+            candidateRevision = fallbackScan.scanPriorityRevision,
+            candidateUpdatedAt = fallbackScan.scanPriorityUpdatedAt,
+            baselineRevision = preferredScan.scanPriorityRevision,
+            baselineUpdatedAt = preferredScan.scanPriorityUpdatedAt,
+        ) -> fallbackScan
+        else -> preferredScan
+    }
     if (candidate == preferredCandidate && rank == preferred.summary.scanPriorityRank &&
         selectedScan.collectionType == preferredScan.collectionType &&
         selectedScan.scanMarked == preferredScan.scanMarked &&
         selectedScan.scanSourceCollectionId == preferredScan.scanSourceCollectionId &&
         selectedScan.scanDestinationCollectionId == preferredScan.scanDestinationCollectionId &&
-        selectedScan.scanRevision == preferredScan.scanRevision
+        selectedScan.scanRevision == preferredScan.scanRevision &&
+        prioritySource.scanPriorityAssessment == preferredScan.scanPriorityAssessment &&
+        prioritySource.scanPriorityAssessmentKnown == preferredScan.scanPriorityAssessmentKnown &&
+        prioritySource.scanPriorityRevision == preferredScan.scanPriorityRevision &&
+        prioritySource.scanPriorityUpdatedAt == preferredScan.scanPriorityUpdatedAt
     ) {
         return preferred
     }
@@ -606,6 +655,10 @@ private fun fillUnknownScanMetadata(
         summary = preferred.summary.copy(
             digitizationCandidateClassification = candidate,
             scanPriorityRank = rank,
+            scanPriorityAssessment = prioritySource.scanPriorityAssessment,
+            scanPriorityAssessmentKnown = prioritySource.scanPriorityAssessmentKnown,
+            scanPriorityRevision = prioritySource.scanPriorityRevision,
+            scanPriorityUpdatedAt = prioritySource.scanPriorityUpdatedAt,
             collectionType = selectedScan.collectionType,
             scanMarked = selectedScan.scanMarked,
             scanSourceCollectionId = selectedScan.scanSourceCollectionId,
@@ -739,6 +792,46 @@ private fun captureRowWholeNumber(row: JSONObject, name: String): Long? {
     }
 }
 
+/** A failed/legacy metadata lookup cannot erase a previously cached assessment;
+ * an authoritative newer projection, including explicit Unassessed, does win. */
+private fun retainNewerScanPriority(
+    incoming: RemoteCollectionBook,
+    cached: RemoteCollectionBook,
+): RemoteCollectionBook {
+    if (!cached.scanPriorityAssessmentKnown) return incoming
+    if (incoming.scanPriorityAssessmentKnown && scanPrioritySupersedes(incoming, cached)) {
+        return incoming
+    }
+    return incoming.copy(
+        scanPriorityAssessment = cached.scanPriorityAssessment,
+        scanPriorityAssessmentKnown = true,
+        scanPriorityRevision = cached.scanPriorityRevision,
+        scanPriorityUpdatedAt = cached.scanPriorityUpdatedAt,
+    )
+}
+
+private fun scanPrioritySupersedes(
+    candidate: RemoteCollectionBook,
+    baseline: RemoteCollectionBook,
+): Boolean = scanPriorityVersionSupersedes(
+    candidateRevision = candidate.scanPriorityRevision,
+    candidateUpdatedAt = candidate.scanPriorityUpdatedAt,
+    baselineRevision = baseline.scanPriorityRevision,
+    baselineUpdatedAt = baseline.scanPriorityUpdatedAt,
+)
+
+private fun scanPriorityVersionSupersedes(
+    candidateRevision: Long,
+    candidateUpdatedAt: String,
+    baselineRevision: Long,
+    baselineUpdatedAt: String,
+): Boolean = metadataVersionSupersedes(
+    candidateRevision = candidateRevision,
+    candidateUpdatedAt = candidateUpdatedAt,
+    baselineRevision = baselineRevision,
+    baselineUpdatedAt = baselineUpdatedAt,
+)
+
 /** PostgREST renders timestamptz with an offset ("+00:00"), which
  * [java.time.Instant.parse] rejects. An unreadable stamp sorts last rather than
  * dropping the book. */
@@ -833,6 +926,19 @@ private fun remoteBookToJson(book: RemoteCollectionBook): JSONObject {
         book.scanPriorityRank == null ||
             (book.digitizationCandidateClassification == true && book.scanPriorityRank in 1..5),
     ) { "scan priority rank requires an explicit candidate and must be in 1..5" }
+    require(book.scanPriorityAssessment == null || book.scanPriorityAssessmentKnown) {
+        "scan priority assessment requires an authoritative projection"
+    }
+    require(book.scanPriorityRevision >= 0L) { "scan priority revision must not be negative" }
+    require(book.scanPriorityAssessmentKnown || book.scanPriorityRevision == 0L) {
+        "unknown scan priority cannot carry a revision"
+    }
+    require(book.scanPriorityUpdatedAt.length <= 80) {
+        "scan priority timestamp is too long"
+    }
+    require(book.scanPriorityAssessmentKnown || book.scanPriorityUpdatedAt.isEmpty()) {
+        "unknown scan priority cannot carry a timestamp"
+    }
     require(book.scanRevision >= 0L) { "scan revision must not be negative" }
     require(!book.scanMarked ||
         (book.collectionType == CollectionType.SCAN &&
@@ -857,6 +963,13 @@ private fun remoteBookToJson(book: RemoteCollectionBook): JSONObject {
             book.digitizationCandidateClassification ?: JSONObject.NULL,
         )
         .put("scan_priority_rank", book.scanPriorityRank ?: JSONObject.NULL)
+        .put(
+            "scan_priority",
+            book.scanPriorityAssessment?.wireValue ?: JSONObject.NULL,
+        )
+        .put("scan_priority_known", book.scanPriorityAssessmentKnown)
+        .put("scan_priority_revision", book.scanPriorityRevision)
+        .put("scan_priority_updated_at", book.scanPriorityUpdatedAt)
         .put("collection_type", book.collectionType.wireValue)
         .put("scan_marked", book.scanMarked)
         .put("scan_source_collection_id", book.scanSourceCollectionId)
@@ -889,6 +1002,27 @@ private fun remoteBookFromJson(
     }
     val scanPriorityRank = if (version < 3) null else {
         optionalRemotePriorityRank(row, digitizationCandidateClassification)
+    }
+    val scanPriorityAssessmentKnown = if (version < 5) false else {
+        optionalRemoteBoolean(row, "scan_priority_known")
+            ?: throw IllegalArgumentException("scan_priority_known must be a boolean")
+    }
+    val scanPriorityAssessment = if (version < 5 || !scanPriorityAssessmentKnown) null else {
+        optionalRemotePriorityAssessment(row)
+    }
+    val scanPriorityRevision = if (version < 5) 0L else {
+        requiredRemoteWholeNumber(row, "scan_priority_revision")
+    }
+    require(scanPriorityRevision >= 0L) { "invalid scan priority revision" }
+    require(scanPriorityAssessmentKnown || scanPriorityRevision == 0L) {
+        "unknown scan priority cannot carry a revision"
+    }
+    val scanPriorityUpdatedAt = if (version < 6) "" else {
+        requiredRemoteString(row, "scan_priority_updated_at")
+    }
+    require(scanPriorityUpdatedAt.length <= 80) { "invalid scan priority timestamp" }
+    require(scanPriorityAssessmentKnown || scanPriorityUpdatedAt.isEmpty()) {
+        "unknown scan priority cannot carry a timestamp"
     }
     val collectionType = if (version < 4) CollectionType.CAPTURE else {
         CollectionType.fromWire(requiredRemoteString(row, "collection_type"))
@@ -927,6 +1061,10 @@ private fun remoteBookFromJson(
         createdAt = createdAt,
         digitizationCandidateClassification = digitizationCandidateClassification,
         scanPriorityRank = scanPriorityRank,
+        scanPriorityAssessment = scanPriorityAssessment,
+        scanPriorityAssessmentKnown = scanPriorityAssessmentKnown,
+        scanPriorityRevision = scanPriorityRevision,
+        scanPriorityUpdatedAt = scanPriorityUpdatedAt,
         collectionType = collectionType,
         scanMarked = scanMarked,
         scanSourceCollectionId = scanSourceCollectionId,
@@ -941,6 +1079,15 @@ private fun optionalRemoteBoolean(source: JSONObject, name: String): Boolean? =
         is Boolean -> raw
         else -> throw IllegalArgumentException("$name must be a boolean or null")
     }
+
+private fun optionalRemotePriorityAssessment(source: JSONObject): ScanPriorityAssessment? {
+    val raw = source.opt("scan_priority")
+    if (raw == null || raw === JSONObject.NULL) return null
+    val value = raw as? String
+        ?: throw IllegalArgumentException("scan_priority must be a string or null")
+    return ScanPriorityAssessment.parse(value)
+        ?: throw IllegalArgumentException("invalid scan_priority")
+}
 
 private fun optionalRemotePriorityRank(
     source: JSONObject,

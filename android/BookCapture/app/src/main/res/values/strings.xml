@@ -88,8 +88,15 @@
     <string name="home_whl_available">Available in WHL</string>
     <string name="home_ia_available">Available in Internet Archive</string>
     <string name="home_digitization_candidate">Scan candidate</string>
-    <string name="scan_priority_description">Scan candidate, priority %1$d</string>
-    <string name="scan_priority_unset">Priority not assigned</string>
+    <string name="scan_priority_description">Scan candidate, rank %1$d of 5; 1 is highest</string>
+    <string name="scan_priority_unset">Rank not assigned</string>
+    <string name="scan_priority_assessment_high">Scan priority high</string>
+    <string name="scan_priority_assessment_medium">Scan priority medium</string>
+    <string name="scan_priority_assessment_low">Scan priority low</string>
+    <string name="scan_priority_assessment_no_scan">No scan</string>
+    <string name="scan_priority_assessment_unassessed">Unassessed</string>
+    <string name="scan_priority_assessment_unavailable">Unavailable</string>
+    <string name="detail_scan_priority">Scan priority</string>
     <string name="home_scan_status">Scan status</string>
     <string name="home_scan_status_value">Scan status: %1$s</string>
     <string name="home_availability_detail">%1$s: %2$s</string>

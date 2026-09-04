@@ -69,6 +69,32 @@ class DesktopBookMetadata internal constructor(
     val scanStatus: String get() = dataCopy().strictString("scan_status", 80).orEmpty()
 
     /**
+     * Curator-authored scan assessment. These catalog values are deliberately
+     * independent of both digitization-candidate state and the legacy 1..5
+     * candidate-order rank.
+     */
+    val scanPriorityAssessment: ScanPriorityAssessment?
+        get() {
+            val raw = dataCopy().opt("scan_priority") as? String ?: return null
+            return raw.takeIf { it.length <= 40 }?.let(ScanPriorityAssessment::parse)
+        }
+
+    /**
+     * True only when this projection understands the textual assessment field.
+     * An explicit JSON null is a known Unassessed value; an absent or malformed
+     * field belongs to an older/unknown projection and must not clear newer
+     * cached metadata.
+     */
+    val scanPriorityAssessmentKnown: Boolean
+        get() {
+            val data = dataCopy()
+            if (!data.has("scan_priority")) return false
+            val raw = data.opt("scan_priority")
+            return raw === JSONObject.NULL ||
+                (raw is String && ScanPriorityAssessment.parse(raw) != null)
+        }
+
+    /**
      * Book-level curator classification. `null` is deliberately distinct from
      * an explicit false: projections written before issue #312 did not know the
      * classification, while a curator can explicitly clear it later.
@@ -194,26 +220,32 @@ internal object CaptureMetadataStore {
                 Entries.atomicWrite(file, incoming.toSidecarJson().toString())
                 DesktopMetadataApplyResult.APPLIED
             }
-            incoming.ownerId != local.ownerId ||
-                syncTimestampAfter(incoming.updatedAt, local.updatedAt) -> {
-                // A LAN desktop rotates ownerId when its revision ledger is
-                // lost. A newer server timestamp also lets a compact/pruned or
-                // restored ledger recover without stranding revision 1 behind
-                // a stale higher local revision.
+            incoming.ownerId != local.ownerId -> {
+                // A paired LAN desktop rotates ownerId when its ledger is lost.
                 Entries.atomicWrite(file, incoming.toSidecarJson().toString())
                 DesktopMetadataApplyResult.APPLIED
             }
-            incoming.revision < local.revision -> DesktopMetadataApplyResult.STALE
-            incoming.revision == local.revision && local.semanticallyEquals(incoming) ->
+            metadataVersionSupersedes(
+                    candidateRevision = incoming.revision,
+                    candidateUpdatedAt = incoming.updatedAt,
+                    baselineRevision = local.revision,
+                    baselineUpdatedAt = local.updatedAt,
+                ) -> {
+                // A newer server timestamp lets a compact/pruned or restored
+                // ledger recover without stranding revision 1 behind a stale
+                // higher local revision.
+                Entries.atomicWrite(file, incoming.toSidecarJson().toString())
+                DesktopMetadataApplyResult.APPLIED
+            }
+            metadataVersionSupersedes(
+                candidateRevision = local.revision,
+                candidateUpdatedAt = local.updatedAt,
+                baselineRevision = incoming.revision,
+                baselineUpdatedAt = incoming.updatedAt,
+            ) -> DesktopMetadataApplyResult.STALE
+            local.semanticallyEquals(incoming) ->
                 DesktopMetadataApplyResult.UNCHANGED
-            incoming.revision == local.revision &&
-                syncTimestampBefore(incoming.updatedAt, local.updatedAt) ->
-                DesktopMetadataApplyResult.STALE
-            incoming.revision == local.revision -> DesktopMetadataApplyResult.CONFLICT
-            else -> {
-                Entries.atomicWrite(file, incoming.toSidecarJson().toString())
-                DesktopMetadataApplyResult.APPLIED
-            }
+            else -> DesktopMetadataApplyResult.CONFLICT
         }
     }
 
@@ -582,10 +614,28 @@ private fun syncTimestampAfter(candidate: String, baseline: String): Boolean {
     return left > right
 }
 
-private fun syncTimestampBefore(candidate: String, baseline: String): Boolean {
-    val left = parseSyncTimestamp(candidate) ?: return false
-    val right = parseSyncTimestamp(baseline) ?: return false
-    return left < right
+/**
+ * Compare two server-authored metadata versions without assuming that a
+ * revision ledger lasts forever. Valid timestamps establish the ledger order;
+ * revision breaks timestamp ties and orders legacy values without a readable
+ * timestamp. This is the same ordering used by the desktop-book sidecar and
+ * by photo-free collection caches.
+ */
+internal fun metadataVersionSupersedes(
+    candidateRevision: Long,
+    candidateUpdatedAt: String,
+    baselineRevision: Long,
+    baselineUpdatedAt: String,
+): Boolean {
+    val candidateTimestamp = parseSyncTimestamp(candidateUpdatedAt)
+    val baselineTimestamp = parseSyncTimestamp(baselineUpdatedAt)
+    return when {
+        candidateTimestamp != null && baselineTimestamp != null &&
+            candidateTimestamp != baselineTimestamp -> candidateTimestamp > baselineTimestamp
+        candidateTimestamp != null && baselineTimestamp == null -> true
+        candidateTimestamp == null && baselineTimestamp != null -> false
+        else -> candidateRevision > baselineRevision
+    }
 }
 
 private fun parseSyncTimestamp(value: String): Instant? =

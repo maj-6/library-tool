@@ -1,6 +1,6 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.2-alpha.20` (version code 51) is the Android
+Library Tool Capture `0.5.2-alpha.21` (version code 52) is the Android
 prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
@@ -20,11 +20,12 @@ collection is listed first and expanded initially. Waiting work uses an
 animated indicator, delivered work uses an icon, and the colored state marker
 carries the successful/complete state.
 
-Books marked as scan candidates show a scanner badge and subtle highlight in
-every book view: Home, all Inspect layouts, the archive, the last-captured card,
-and book details. A curator-assigned scan priority appears as a numbered 1–5
-tag; older candidates without an assigned priority use `?` rather than an
-invented rank.
+Curator-assigned scan assessments appear in every book view: Home, all Inspect
+layouts, the archive, the last-captured card, and book details. Compact badges
+show `HI`, `MED`, `LOW`, or `N/S`; explicit no-scan remains distinct from an
+unassessed book. Candidate state is displayed independently with the scanner
+glyph. When no textual assessment exists, older candidates retain their legacy
+numbered 1–5 rank, or `?` when that rank is absent.
 
 Scan-row gestures are literal:
 

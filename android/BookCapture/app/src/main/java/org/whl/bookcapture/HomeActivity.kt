@@ -551,6 +551,8 @@ class HomeActivity : AppCompatActivity() {
                 UploadWorker.EXPLICIT_SYNC_WORK_NAME,
                 CaptureMetadataSyncWorker.WORK_NAME,
                 CaptureMetadataSyncWorker.PULL_WORK_NAME,
+                CaptureMetadataSyncWorker.LAN_WORK_NAME,
+                CaptureMetadataSyncWorker.LAN_PULL_WORK_NAME,
             ))
             .observe(this) {
                 scheduleWorkerRefresh(contentChanged = true)
@@ -2348,10 +2350,11 @@ class HomeActivity : AppCompatActivity() {
             summary.author.ifEmpty { getString(R.string.inspect_content_missing) }
         view.findViewById<TextView>(R.id.inspectYear)?.text =
             summary.year.ifEmpty { getString(R.string.inspect_content_missing) }
-        bindScanPriorityIndicator(
-            view,
-            summary.digitizationCandidate,
-            summary.scanPriorityRank,
+        val scanPriority = bindScanPriorityIndicator(
+            bookView = view,
+            candidate = summary.digitizationCandidate,
+            rank = summary.scanPriorityRank,
+            assessment = summary.scanPriorityAssessment,
         )
         val details = mutableListOf<String>()
         summary.author.takeIf { it.isNotEmpty() }?.let(details::add)
@@ -2395,17 +2398,10 @@ class HomeActivity : AppCompatActivity() {
             ).show()
         }
         val entryId = summary.entryId
-        val priorityDescription = scanPriorityPresentation(
-            candidate = summary.digitizationCandidate,
-            rank = summary.scanPriorityRank,
-            candidateLabel = getString(R.string.home_digitization_candidate),
-            rankLabel = { getString(R.string.scan_priority_description, it) },
-            rankUnsetLabel = getString(R.string.scan_priority_unset),
-        ).accessibilityLabel
         view.contentDescription = listOf(
             snapshot.titleLabel,
             details.joinToString(" \u00b7 "),
-            priorityDescription,
+            scanPriority.accessibilityLabel,
         ).filter(String::isNotEmpty).joinToString(", ")
         view.setOnClickListener {
             if (inspectActionMode != null) toggleInspectSelection(entryId) else open()
@@ -2536,10 +2532,11 @@ class HomeActivity : AppCompatActivity() {
             row.findViewById<TextView>(R.id.inspectLookupCollection).text =
                 collectionDescription
             val summary = item.snapshot.item.summary
-            bindScanPriorityIndicator(
-                row,
-                summary.digitizationCandidate,
-                summary.scanPriorityRank,
+            val scanPriority = bindScanPriorityIndicator(
+                bookView = row,
+                candidate = summary.digitizationCandidate,
+                rank = summary.scanPriorityRank,
+                assessment = summary.scanPriorityAssessment,
             )
             item.snapshot.item.current?.let { entry ->
                 thumbnails += ThumbnailRequest(
@@ -2549,19 +2546,12 @@ class HomeActivity : AppCompatActivity() {
                     image = row.findViewById(R.id.inspectThumb),
                 )
             }
-            val priorityDescription = scanPriorityPresentation(
-                candidate = summary.digitizationCandidate,
-                rank = summary.scanPriorityRank,
-                candidateLabel = getString(R.string.home_digitization_candidate),
-                rankLabel = { getString(R.string.scan_priority_description, it) },
-                rankUnsetLabel = getString(R.string.scan_priority_unset),
-            ).accessibilityLabel
             row.contentDescription = listOf(
                 item.book.title,
                 item.book.author,
                 item.book.year,
                 collectionDescription,
-                priorityDescription,
+                scanPriority.accessibilityLabel,
             ).filter(String::isNotBlank).joinToString(", ")
             row.setOnClickListener {
                 val queueId = activeScanSearchQueueId
@@ -4538,9 +4528,10 @@ class HomeActivity : AppCompatActivity() {
 
         bindCatalogIndicators(row, entry)
         bindScanPriorityIndicator(
-            row,
-            entryScanCandidate(this, entry),
-            desktop?.scanPriorityRank,
+            bookView = row,
+            candidate = entryScanCandidate(this, entry),
+            rank = desktop?.scanPriorityRank,
+            assessment = desktop?.scanPriorityAssessment,
         )
         row.findViewById<ImageView>(R.id.scanStatus).apply {
             val status = desktop?.scanStatus.orEmpty().trim()

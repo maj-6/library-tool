@@ -18,15 +18,16 @@
 
     <TextView
         android:id="@+id/scanPriorityBadge"
-        android:layout_width="17dp"
-        android:layout_height="17dp"
+        android:layout_width="27dp"
+        android:layout_height="18dp"
         android:layout_gravity="end|bottom"
         android:background="@drawable/whl_scan_priority_badge"
         android:fontFamily="monospace"
         android:gravity="center"
         android:includeFontPadding="false"
         android:importantForAccessibility="no"
+        android:maxLines="1"
         android:textColor="@color/whl_face_hi"
-        android:textSize="10sp"
+        android:textSize="8sp"
         android:textStyle="bold" />
 </FrameLayout>

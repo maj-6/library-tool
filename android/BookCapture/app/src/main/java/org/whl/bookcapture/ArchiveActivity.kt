@@ -8,6 +8,7 @@ import android.widget.ImageView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -26,14 +27,15 @@ import java.util.Locale
  * Retention displaces captures out of the browsing list rather than deleting
  * them (see [CaptureArchive]); without somewhere to look at the result, that
  * guarantee is invisible and untestable by the person relying on it. This
- * screen is deliberately read-only. The archive is not a sync source and no
- * worker enumerates it, so offering edits here would produce changes that
- * silently never leave the phone.
+ * screen is deliberately read-only. Sync refreshes a small rotating window of
+ * desktop-authored book metadata for display, but archived captures remain
+ * excluded from review, media, and other mutable sync families.
  */
 class ArchiveActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityArchiveBinding
     private var thumbJob: Job? = null
+    private var renderJob: Job? = null
 
     private data class ArchiveThumbnail(
         val entry: Entries.Entry,
@@ -46,6 +48,14 @@ class ArchiveActivity : AppCompatActivity() {
         setContentView(binding.root)
         binding.toolbar.setNavigationOnClickListener { finish() }
         RemoteUiCatalog.apply(binding.root)
+        WorkManager.getInstance(this)
+            .getWorkInfosLiveData(activeUniqueWorkQuery(
+                CaptureMetadataSyncWorker.WORK_NAME,
+                CaptureMetadataSyncWorker.PULL_WORK_NAME,
+                CaptureMetadataSyncWorker.LAN_WORK_NAME,
+                CaptureMetadataSyncWorker.LAN_PULL_WORK_NAME,
+            ))
+            .observe(this) { render() }
     }
 
     override fun onResume() {
@@ -54,13 +64,16 @@ class ArchiveActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        renderJob?.cancel()
+        renderJob = null
         thumbJob?.cancel()
         thumbJob = null
         super.onPause()
     }
 
     private fun render() {
-        lifecycleScope.launch {
+        renderJob?.cancel()
+        renderJob = lifecycleScope.launch {
             val entries = withContext(Dispatchers.IO) { Entries.archived(this@ArchiveActivity) }
             val bytes = withContext(Dispatchers.IO) {
                 CaptureArchive.archiveBytes(this@ArchiveActivity)
@@ -108,6 +121,7 @@ class ArchiveActivity : AppCompatActivity() {
                 bookView = row.root,
                 candidate = entryScanCandidate(this, entry),
                 rank = entry.desktopBook?.scanPriorityRank,
+                assessment = entry.desktopBook?.scanPriorityAssessment,
             )
             row.root.contentDescription = listOf(
                 title,
