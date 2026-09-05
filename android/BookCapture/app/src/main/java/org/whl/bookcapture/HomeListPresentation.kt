@@ -120,8 +120,8 @@ internal fun matchingInspectCollectionChoices(
                 else -> 3
             }
             val words = fields.flatMap { it.split(' ') }
-            val termRank = terms.sumOf { term ->
-                when {
+            val termRank = terms.fold(0) { rank, term ->
+                rank + when {
                     words.any { it == term } -> 0
                     words.any { it.startsWith(term) } -> 1
                     else -> 2
