@@ -36,7 +36,7 @@ def test_processing_queue_migration_precedes_cas_hardening_and_reuses_existing_t
         "('032_scan_search_processing_queue') on conflict do nothing;"
     )
     assert cloud_setup.migration_files()[-1].name == (
-        "033_scan_search_queue_cas_hardening.sql"
+        "037_capture_scan_priority_source_ordering.sql"
     )
     assert cloud_setup.expected_schema(SQL) == {}
     assert "create table" not in FLAT

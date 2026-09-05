@@ -36,7 +36,7 @@ def test_deferred_review_migration_declares_its_delta():
         "('031_scan_search_deferred_review') on conflict do nothing;"
     )
     assert cloud_setup.migration_files()[-1].name == (
-        "033_scan_search_queue_cas_hardening.sql"
+        "037_capture_scan_priority_source_ordering.sql"
     )
     assert cloud_setup.expected_schema(SQL) == {
         "scan_search_queue": {

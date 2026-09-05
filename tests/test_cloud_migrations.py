@@ -1144,7 +1144,9 @@ def test_capture_collection_inventory_preserves_provenance_and_tombstones():
         "photo_count", "removed", "membership_revision", "collection_type",
         "scan_marked", "scan_source_collection_id",
         "scan_destination_collection_id", "scan_revision", "scan_marked_at",
-        "scan_updated_at",
+        "scan_updated_at", "scan_priority", "scan_priority_known",
+        "scan_priority_catalog_record_id", "scan_priority_source_revision",
+        "scan_priority_source_updated_at",
     ]
 
 

@@ -34,7 +34,7 @@ def test_scan_workflow_migration_records_itself_and_discovers_latest():
         "('029_scan_collection_workflow') on conflict do nothing;"
     )
     assert cloud_setup.migration_files()[-1].stem == (
-        "033_scan_search_queue_cas_hardening"
+        "037_capture_scan_priority_source_ordering"
     )
     schema = cloud_setup.expected_schema(SQL)
     assert schema["collections"] == {"collection_type"}
@@ -248,6 +248,11 @@ def test_inventory_exposes_the_shared_android_desktop_aliases():
         "scan_revision",
         "scan_marked_at",
         "scan_updated_at",
+        "scan_priority",
+        "scan_priority_known",
+        "scan_priority_catalog_record_id",
+        "scan_priority_source_revision",
+        "scan_priority_source_updated_at",
     ]
 
 
