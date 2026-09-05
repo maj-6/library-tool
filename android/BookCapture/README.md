@@ -1,6 +1,6 @@
 # Library Tool Capture (Android)
 
-Library Tool Capture `0.5.2-alpha.21` (version code 52) is the Android
+Library Tool Capture `0.5.2-alpha.22` (version code 53) is the Android
 prerelease companion for Library Tool. It photographs books, runs OCR and catalog
 extraction in the background, and sends captures either through the cloud or
 directly to a paired desktop on the local network.
@@ -116,16 +116,18 @@ encoded as its QR label; renaming a collection does not silently change a tag
 that may already be printed.
 
 The **Inspect** tab gives a compact collection overview and opens a box directly
-from its QR label. It can also identify a book's collection from a typed title
-or a photographed cover. Cover identification sends a temporary, resized image
-to Mistral OCR 4.1 using the API key in Settings, then matches the returned text
-against the owner's collection inventory; it does not create or modify a book.
-A selected box can be browsed as Windows-like **Tiles**, **Content**, or
-**Icons**. The display choice is kept on the device and scanning a box does not
-change the collection used by the next capture. Inspect retains only a small
-bibliographic summary when old delivered scan media is cleared, so the list
-remains useful without defeating the app's storage limit; cleared photos and
-their local detail view are not retained.
+from its QR label. Its collection picker searches hierarchy paths, names,
+printed tag IDs, and recorded origins, so a box need not be found by scrolling
+through every collection. Inspect can also identify a book's collection from a
+typed title or a photographed cover. Cover identification sends a temporary,
+resized image to Mistral OCR 4.1 using the API key in Settings, then matches the
+returned text against the owner's collection inventory; it does not create or
+modify a book. A selected box can be browsed as Windows-like **Tiles**,
+**Content**, or **Icons**. The display choice is kept on the device and scanning
+a box does not change the collection used by the next capture. Inspect retains
+only a small bibliographic summary when old delivered scan media is cleared, so
+the list remains useful without defeating the app's storage limit; cleared
+photos and their local detail view are not retained.
 
 The **Physical Scan Queue** tab opens a role-neutral capture flow and groups
 queued sessions by status, destination, match confidence, and corroborating

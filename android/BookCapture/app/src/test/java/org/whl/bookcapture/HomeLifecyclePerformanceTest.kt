@@ -122,6 +122,38 @@ class HomeLifecyclePerformanceTest {
     }
 
     @Test
+    fun inspectCollectionSearchFiltersTheLoadedSnapshotWithoutReloadingTheTab() {
+        val adapter = section(
+            "private class InspectCollectionSearchAdapter(",
+            "internal data class InspectMembershipIsolationResult(",
+        )
+        assertTrue(adapter.contains("matchingInspectCollectionChoices("))
+        assertFalse(adapter.contains("Collections.allRecords("))
+        assertFalse(adapter.contains("CollectionInventory.items("))
+        assertFalse(adapter.contains("ensureRemoteBoxListing("))
+        assertFalse(adapter.contains("refreshInspect()"))
+
+        val openSearch = section(
+            "private fun beginInspectCollectionSearch()",
+            "private fun selectInspectCollection(",
+        )
+        assertTrue(openSearch.contains("adapter.filter.filter("))
+        assertTrue(openSearch.contains("field.showDropDown()"))
+        assertFalse(openSearch.contains("refreshInspect()"))
+
+        val select = section(
+            "private fun selectInspectCollection(",
+            "private fun renderInspectBooks(",
+        )
+        assertTrue(select.contains("inspectedCollectionId = collection.id"))
+        assertTrue(select.contains("clearInspectSelection()"))
+        assertTrue(select.contains("refreshInspect()"))
+
+        val render = section("private fun renderInspect(", "private fun renderInspectBooks(")
+        assertFalse(render.contains("inspectCollectionChips"))
+    }
+
+    @Test
     fun collectionBookCountsRunOffTheUiThread() {
         val refresh = section("private fun refreshCollections()", "private fun renderCollections(")
         assertTrue(refresh.contains("loadHomeSnapshot"))

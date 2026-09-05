@@ -3,7 +3,6 @@ package org.whl.bookcapture
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
@@ -83,6 +82,98 @@ private class CollectionNameSuggestionAdapter(
     }
 
     override fun getFilter(): Filter = suggestionFilter
+}
+
+/**
+ * A bounded, snapshot-backed collection picker for Inspect.
+ *
+ * Filtering is deliberately pure in-memory work. Collection and inventory
+ * files are loaded by [HomeActivity.refreshInspect], never once per keystroke.
+ */
+private class InspectCollectionSearchAdapter(
+    context: Context,
+    private val collections: List<BookCollection>,
+    private val collectionPaths: Map<String, String>,
+    private val bookCounts: Map<String, Int>,
+) : ArrayAdapter<InspectCollectionChoice>(
+    context,
+    R.layout.item_inspect_collection_search,
+) {
+    private var visibleChoices = matchingInspectCollectionChoices(
+        collections,
+        collectionPaths,
+        query = "",
+    )
+
+    private val searchFilter = object : Filter() {
+        override fun performFiltering(constraint: CharSequence?): FilterResults {
+            val choices = matchingInspectCollectionChoices(
+                collections,
+                collectionPaths,
+                constraint?.toString().orEmpty(),
+            )
+            return FilterResults().apply {
+                values = choices
+                count = choices.size
+            }
+        }
+
+        override fun publishResults(constraint: CharSequence?, results: FilterResults) {
+            @Suppress("UNCHECKED_CAST")
+            visibleChoices = results.values as? List<InspectCollectionChoice> ?: emptyList()
+            if (visibleChoices.isEmpty()) notifyDataSetInvalidated() else notifyDataSetChanged()
+        }
+
+        override fun convertResultToString(resultValue: Any?): CharSequence =
+            (resultValue as? InspectCollectionChoice)?.displayPath.orEmpty()
+    }
+
+    override fun getCount(): Int = visibleChoices.size
+
+    override fun getItem(position: Int): InspectCollectionChoice? =
+        visibleChoices.getOrNull(position)
+
+    override fun getItemId(position: Int): Long =
+        getItem(position)?.collectionId?.hashCode()?.toLong() ?: position.toLong()
+
+    override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+        val row = convertView ?: LayoutInflater.from(context).inflate(
+            R.layout.item_inspect_collection_search,
+            parent,
+            false,
+        )
+        val choice = getItem(position) ?: return row
+        val count = bookCounts[choice.collectionId] ?: 0
+        val countLabel = context.resources.getQuantityString(
+            R.plurals.inspect_book_count,
+            count,
+            count,
+        )
+        val meta = listOf(
+            context.getString(R.string.inspect_collection_search_tag, choice.tagId),
+            choice.origin.takeIf(String::isNotEmpty)?.let {
+                context.getString(R.string.collections_row_from, it)
+            }.orEmpty(),
+            countLabel,
+        ).filter(String::isNotEmpty).joinToString(" \u00b7 ")
+        row.findViewById<TextView>(R.id.inspectCollectionSearchName).text = choice.displayPath
+        row.findViewById<TextView>(R.id.inspectCollectionSearchMeta).text = meta
+        val accessibleMeta = listOf(
+            choice.origin.takeIf(String::isNotEmpty)?.let {
+                context.getString(R.string.collections_row_from, it)
+            }.orEmpty(),
+            countLabel,
+        ).filter(String::isNotEmpty).joinToString(", ")
+        row.contentDescription = context.getString(
+            R.string.inspect_collection_search_result_description,
+            choice.displayPath,
+            choice.tagId,
+            accessibleMeta,
+        )
+        return row
+    }
+
+    override fun getFilter(): Filter = searchFilter
 }
 
 internal data class InspectMembershipIsolationResult(
@@ -489,6 +580,64 @@ class HomeActivity : AppCompatActivity() {
             binding.inspectBookSearch.clearFocus()
             renderInspectLookup()
             ensureRemoteInspectLookup()
+            true
+        }
+        binding.inspectCollectionSearch.setOnItemClickListener { parent, _, position, _ ->
+            val choice = parent.getItemAtPosition(position) as? InspectCollectionChoice
+                ?: return@setOnItemClickListener
+            selectInspectCollection(choice.collectionId)
+        }
+        binding.inspectCollectionSearch.setOnFocusChangeListener { _, hasFocus ->
+            if (hasFocus) beginInspectCollectionSearch()
+            else restoreInspectCollectionSearchSelection()
+        }
+        binding.inspectCollectionSearch.setOnClickListener {
+            beginInspectCollectionSearch()
+        }
+        binding.inspectCollectionSearch.doAfterTextChanged {
+            if (binding.inspectCollectionSearch.hasFocus()) {
+                binding.inspectCollectionSearch.error = null
+            }
+        }
+        binding.inspectCollectionSearch.setOnEditorActionListener { field, actionId, _ ->
+            if (actionId != android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH) {
+                return@setOnEditorActionListener false
+            }
+            val query = field.text?.toString().orEmpty()
+            if (query.isBlank()) {
+                beginInspectCollectionSearch()
+            } else {
+                val choices = matchingInspectCollectionChoices(
+                    inspectRenderedCollections,
+                    inspectRenderedCollectionPaths,
+                    query,
+                    limit = 2,
+                )
+                when (choices.size) {
+                    0 -> {
+                        binding.inspectCollectionSearch.error =
+                            getString(R.string.inspect_collection_search_no_matches)
+                        binding.inspectCollectionSearch.announceForAccessibility(
+                            getString(R.string.inspect_collection_search_no_matches),
+                        )
+                    }
+                    1 -> selectInspectCollection(choices.single().collectionId)
+                    else -> {
+                        binding.inspectCollectionSearch.announceForAccessibility(
+                            getString(R.string.inspect_collection_search_choose_match),
+                        )
+                        val collectionSearch = binding.inspectCollectionSearch
+                        val adapter = collectionSearch.adapter as? InspectCollectionSearchAdapter
+                        adapter?.filter?.filter(query) {
+                            if (collectionSearch.adapter === adapter &&
+                                canShowInspectCollectionSearch()
+                            ) {
+                                collectionSearch.showDropDown()
+                            }
+                        }
+                    }
+                }
+            }
             true
         }
         binding.inspectScanCover.setOnClickListener {
@@ -1098,7 +1247,11 @@ class HomeActivity : AppCompatActivity() {
             cancelCollectionBarLoading()
         }
         if (tab != HomeTab.COLLECTIONS) cancelCollectionListLoading()
-        if (tab != HomeTab.INSPECT) cancelInspectLoading()
+        if (tab != HomeTab.INSPECT) {
+            cancelInspectLoading()
+            binding.inspectCollectionSearch.dismissDropDown()
+            binding.inspectCollectionSearch.clearFocus()
+        }
         binding.homeList.visibility = if (tab == HomeTab.SCANS) View.VISIBLE else View.GONE
         binding.collectionsList.visibility =
             if (tab == HomeTab.COLLECTIONS) View.VISIBLE else View.GONE
@@ -2111,11 +2264,21 @@ class HomeActivity : AppCompatActivity() {
             collectionCount,
             totalBookCount,
         )
-        binding.inspectCollectionChips.removeAllViews()
         binding.inspectBooks.removeAllViews()
         inspectBookViews.clear()
         inspectRenderedCollections = collections
         inspectRenderedCollectionPaths = paths
+        val collectionSearchDraft = binding.inspectCollectionSearch.text?.toString()
+            .orEmpty()
+            .takeIf { binding.inspectCollectionSearch.hasFocus() }
+        val collectionSearchAdapter = InspectCollectionSearchAdapter(
+            this,
+            collections,
+            paths,
+            counts,
+        )
+        binding.inspectCollectionSearch.setAdapter(collectionSearchAdapter)
+        binding.inspectCollectionSearch.error = null
 
         if (inspectLookupActive()) {
             clearInspectSelection()
@@ -2124,7 +2287,8 @@ class HomeActivity : AppCompatActivity() {
         }
         binding.inspectLookupStatus.visibility = View.GONE
         binding.inspectLookupResults.visibility = View.GONE
-        binding.inspectCollectionScroll.visibility = View.VISIBLE
+        binding.inspectCollectionSearchLabel.visibility = View.VISIBLE
+        binding.inspectCollectionSearch.visibility = View.VISIBLE
         binding.inspectBooks.visibility = View.VISIBLE
 
         if (collections.isEmpty()) {
@@ -2132,6 +2296,10 @@ class HomeActivity : AppCompatActivity() {
             inspectRenderedItems = emptyMap()
             inspectedCollectionId = null
             inspectVisibleBookLimit = INSPECT_BOOK_PAGE_SIZE
+            binding.inspectCollectionSearch.isEnabled = false
+            binding.inspectCollectionSearch.setText("", false)
+            binding.inspectCollectionSearchLabel.visibility = View.GONE
+            binding.inspectCollectionSearch.visibility = View.GONE
             binding.inspectSelectionHeader.visibility = View.GONE
             binding.inspectEmpty.visibility = View.VISIBLE
             binding.inspectEmpty.text = getString(R.string.inspect_empty_collections)
@@ -2142,72 +2310,25 @@ class HomeActivity : AppCompatActivity() {
             ?: collections.firstOrNull { it.id == snapshot.currentCollectionId }
             ?: collections.first()
         inspectedCollectionId = selected.id
+        val selectedName = paths[selected.id] ?: selected.name
+        binding.inspectCollectionSearch.isEnabled = true
+        if (collectionSearchDraft != null) {
+            binding.inspectCollectionSearch.setText(collectionSearchDraft, false)
+            binding.inspectCollectionSearch.setSelection(collectionSearchDraft.length)
+            collectionSearchAdapter.filter.filter(collectionSearchDraft) {
+                if (binding.inspectCollectionSearch.adapter === collectionSearchAdapter &&
+                    canShowInspectCollectionSearch()
+                ) {
+                    binding.inspectCollectionSearch.showDropDown()
+                }
+            }
+        } else {
+            restoreInspectCollectionSearchSelection()
+        }
         // The local rows are already rendered below; this only adds the books the
         // cloud knows about and this phone does not. Idempotent per session, so
         // the show-more path can re-render without re-fetching.
         ensureRemoteBoxListing(selected.id)
-
-        var selectedChip: View? = null
-        val inflater = LayoutInflater.from(this)
-        collections.forEach { collection ->
-            val chip = inflater.inflate(
-                R.layout.item_inspect_collection,
-                binding.inspectCollectionChips,
-                false,
-            ) as MaterialButton
-            val count = counts[collection.id] ?: 0
-            val bookCount = resources.getQuantityString(
-                R.plurals.inspect_book_count,
-                count,
-                count,
-            )
-            val displayName = paths[collection.id] ?: collection.name
-            chip.text = getString(
-                R.string.inspect_collection_chip,
-                displayName,
-                collection.tagId,
-                bookCount,
-            )
-            chip.contentDescription = getString(
-                R.string.inspect_collection_description,
-                displayName,
-                collection.tagId,
-                bookCount,
-            )
-            val isSelected = collection.id == selected.id
-            chip.isSelected = isSelected
-            ViewCompat.setStateDescription(
-                chip,
-                getString(R.string.selection_selected_state).takeIf { isSelected },
-            )
-            chip.strokeWidth = dp(if (isSelected) 2 else 1)
-            chip.strokeColor = ColorStateList.valueOf(
-                getColor(if (isSelected) R.color.whl_cyan else R.color.whl_face_sh2),
-            )
-            chip.backgroundTintList = ColorStateList.valueOf(
-                getColor(if (isSelected) R.color.whl_row_checked else R.color.whl_face_hi),
-            )
-            chip.setOnClickListener {
-                clearInspectSelection()
-                inspectedCollectionId = collection.id
-                refreshInspect()
-            }
-            RemoteUiCatalog.apply(chip)
-            binding.inspectCollectionChips.addView(chip)
-            if (isSelected) selectedChip = chip
-        }
-        selectedChip?.let { chip ->
-            binding.inspectCollectionScroll.post {
-                if (activeTab == HomeTab.INSPECT && chip.isAttachedToWindow) {
-                    binding.inspectCollectionScroll.smoothScrollTo(
-                        (chip.left - dp(10)).coerceAtLeast(0),
-                        0,
-                    )
-                }
-            }
-        }
-
-        val selectedName = paths[selected.id] ?: selected.name
         val selectedItems = snapshot.itemsByCollection[selected.id].orEmpty()
         inspectRenderedItems = selectedItems.associateBy { it.item.summary.entryId }
         inspectSelection = inspectSelection.reconcile(inspectRenderedItems.keys)
@@ -2291,6 +2412,74 @@ class HomeActivity : AppCompatActivity() {
                 },
             )
         }
+    }
+
+    /** Open the bounded chooser with the current label ready to be replaced. */
+    private fun beginInspectCollectionSearch() {
+        val field = binding.inspectCollectionSearch
+        if (!field.isEnabled || !field.isShown) return
+        val selectedLabel = inspectRenderedCollections
+            .firstOrNull { it.id == inspectedCollectionId }
+            ?.let { inspectRenderedCollectionPaths[it.id] ?: it.name }
+        val query = if (selectedLabel != null && field.text?.toString() == selectedLabel) {
+            // Keep the authoritative selection visible while browsing all
+            // choices. Selecting the text makes the first typed character
+            // replace it without confusing a draft with the open collection.
+            field.selectAll()
+            ""
+        } else {
+            field.text?.toString().orEmpty()
+        }
+        field.error = null
+        val adapter = field.adapter as? InspectCollectionSearchAdapter ?: return
+        adapter.filter.filter(query) {
+            if (field.adapter === adapter && canShowInspectCollectionSearch()) {
+                field.showDropDown()
+            }
+        }
+    }
+
+    /** Keep free text from masquerading as the collection that is actually open. */
+    private fun restoreInspectCollectionSearchSelection() {
+        val field = binding.inspectCollectionSearch
+        field.dismissDropDown()
+        field.error = null
+        val collection = inspectRenderedCollections.firstOrNull {
+            it.id == inspectedCollectionId
+        }
+        field.setText(
+            collection?.let { inspectRenderedCollectionPaths[it.id] ?: it.name }.orEmpty(),
+            false,
+        )
+    }
+
+    private fun canShowInspectCollectionSearch(): Boolean =
+        activeTab == HomeTab.INSPECT &&
+            lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) &&
+            binding.inspectCollectionSearch.hasFocus() &&
+            binding.inspectCollectionSearch.hasWindowFocus() &&
+            binding.inspectCollectionSearch.isAttachedToWindow &&
+            binding.inspectCollectionSearch.isShown
+
+    /** Commit only the stable collection id carried by a dropdown result. */
+    private fun selectInspectCollection(collectionId: String) {
+        val collection = inspectRenderedCollections.firstOrNull { it.id == collectionId }
+        if (collection == null) {
+            binding.inspectCollectionSearch.error =
+                getString(R.string.collections_error_missing)
+            return
+        }
+        clearInspectSelection()
+        inspectedCollectionId = collection.id
+        binding.inspectCollectionSearch.error = null
+        binding.inspectCollectionSearch.setText(
+            inspectRenderedCollectionPaths[collection.id] ?: collection.name,
+            false,
+        )
+        binding.inspectCollectionSearch.dismissDropDown()
+        binding.inspectCollectionSearch.clearFocus()
+        inspectRenderedSnapshot?.let(::renderInspect)
+        refreshInspect()
     }
 
     private fun renderInspectBooks(items: List<InspectBookSnapshot>) {
@@ -2429,7 +2618,7 @@ class HomeActivity : AppCompatActivity() {
         snapshot ?: return
         if (!inspectLookupActive()) {
             if (binding.inspectLookupResults.visibility == View.VISIBLE ||
-                binding.inspectCollectionScroll.visibility != View.VISIBLE
+                binding.inspectCollectionSearch.visibility != View.VISIBLE
             ) {
                 renderInspect(snapshot)
             }
@@ -2437,7 +2626,9 @@ class HomeActivity : AppCompatActivity() {
         }
 
         resetThumbnailLoading()
-        binding.inspectCollectionScroll.visibility = View.GONE
+        binding.inspectCollectionSearch.dismissDropDown()
+        binding.inspectCollectionSearchLabel.visibility = View.GONE
+        binding.inspectCollectionSearch.visibility = View.GONE
         binding.inspectSelectionHeader.visibility = View.GONE
         binding.inspectEmpty.visibility = View.GONE
         binding.inspectBooks.visibility = View.GONE

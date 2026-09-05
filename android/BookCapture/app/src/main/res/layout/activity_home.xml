@@ -301,23 +301,34 @@
                     android:paddingEnd="8dp"
                     android:visibility="gone" />
 
-                <HorizontalScrollView
-                    android:id="@+id/inspectCollectionScroll"
+                <TextView
+                    android:id="@+id/inspectCollectionSearchLabel"
+                    style="@style/WhlLabel"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
+                    android:layout_marginStart="14dp"
                     android:layout_marginTop="8dp"
-                    android:clipToPadding="false"
-                    android:fillViewport="false"
-                    android:paddingStart="10dp"
-                    android:paddingEnd="10dp"
-                    android:scrollbars="none">
+                    android:layout_marginEnd="14dp"
+                    android:labelFor="@id/inspectCollectionSearch"
+                    android:text="@string/inspect_collection_search_label" />
 
-                    <LinearLayout
-                        android:id="@+id/inspectCollectionChips"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:orientation="horizontal" />
-                </HorizontalScrollView>
+                <androidx.appcompat.widget.AppCompatAutoCompleteTextView
+                    android:id="@+id/inspectCollectionSearch"
+                    style="@style/WhlInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="12dp"
+                    android:layout_marginTop="4dp"
+                    android:layout_marginEnd="12dp"
+                    android:completionThreshold="1"
+                    android:hint="@string/inspect_collection_search_hint"
+                    android:imeOptions="actionSearch"
+                    android:importantForAutofill="no"
+                    android:inputType="textCapWords"
+                    android:maxLines="1"
+                    android:minHeight="52dp"
+                    android:selectAllOnFocus="true"
+                    android:singleLine="true" />
 
                 <LinearLayout
                     android:id="@+id/inspectSelectionHeader"

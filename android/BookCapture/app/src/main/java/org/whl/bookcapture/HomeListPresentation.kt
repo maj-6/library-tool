@@ -1,5 +1,7 @@
 package org.whl.bookcapture
 
+import java.text.Normalizer
+
 /** A collapsible Home-list section. [items] retain their newest-first order. */
 internal data class ScanCollectionGroup<T>(
     val key: String,
@@ -11,6 +13,131 @@ internal const val UNFILED_SCAN_GROUP = "__unfiled__"
 internal const val HOME_SCAN_PAGE_SIZE = 24
 
 private const val COLLECTION_PATH_SEPARATOR = " > "
+
+/** Keep the exposed dropdown useful without constructing an unbounded menu. */
+internal const val INSPECT_COLLECTION_SEARCH_LIMIT = 24
+
+/**
+ * One stable collection option for the Inspect selector.
+ *
+ * [collectionId] is the identity committed by the UI. The visible path is only
+ * presentation text and must never be reverse-mapped to recover that identity.
+ */
+internal data class InspectCollectionChoice(
+    val collectionId: String,
+    val displayPath: String,
+    val name: String,
+    val tagId: String,
+    val origin: String,
+) {
+    override fun toString(): String = displayPath
+}
+
+private data class RankedInspectCollectionChoice(
+    val choice: InspectCollectionChoice,
+    val phraseRank: Int,
+    val termRank: Int,
+)
+
+private val INSPECT_COLLECTION_SEARCH_BOUNDARY = Regex("[^\\p{L}\\p{N}]+")
+private val INSPECT_COLLECTION_SEARCH_MARKS = Regex("\\p{M}+")
+
+/**
+ * Normalize collection-search text into the words a person would type.
+ *
+ * In particular, a printed tag such as `FUNGI_BOX_7` must be findable as
+ * either "fungi_box" or "fungi box". Treating all punctuation as a word
+ * boundary also makes a displayed hierarchy path searchable without requiring
+ * the user to type its `>` separators.
+ */
+private fun normalizeInspectCollectionSearchText(value: String): String =
+    Normalizer.normalize(value, Normalizer.Form.NFKD)
+        .replace(INSPECT_COLLECTION_SEARCH_MARKS, "")
+        .lowercase()
+        .replace(INSPECT_COLLECTION_SEARCH_BOUNDARY, " ")
+        .trim()
+
+/**
+ * Search the already-loaded live collections shown by Inspect.
+ *
+ * Every query term must occur in at least one of the path, leaf name, printed
+ * tag, or origin fields. Whole-field matches rank ahead of prefixes, which rank
+ * ahead of substrings; the remaining term quality and alphabetic identity
+ * fields make the result deterministic. A blank query is the bounded,
+ * alphabetic collection chooser used when the field is first opened.
+ */
+internal fun matchingInspectCollectionChoices(
+    collections: List<BookCollection>,
+    collectionPaths: Map<String, String>,
+    query: String,
+    limit: Int = INSPECT_COLLECTION_SEARCH_LIMIT,
+): List<InspectCollectionChoice> {
+    if (limit <= 0) return emptyList()
+    val choices = collections.asSequence()
+        .filter { !it.deleted && it.mergedInto == null }
+        .map { collection ->
+            InspectCollectionChoice(
+                collectionId = collection.id,
+                displayPath = collectionPaths[collection.id]
+                    ?.trim()
+                    ?.takeIf(String::isNotEmpty)
+                    ?: collection.name.trim(),
+                name = collection.name.trim(),
+                tagId = collection.tagId.trim(),
+                origin = collection.from.trim(),
+            )
+        }
+        .toList()
+
+    val alphabetic = compareBy<InspectCollectionChoice> {
+        it.displayPath.lowercase()
+    }.thenBy {
+        it.tagId.lowercase()
+    }.thenBy {
+        it.collectionId
+    }
+    if (query.isBlank()) return choices.sortedWith(alphabetic).take(limit)
+    val normalizedQuery = normalizeInspectCollectionSearchText(query)
+    if (normalizedQuery.isEmpty()) return emptyList()
+
+    val terms = normalizedQuery.split(' ')
+    return choices.asSequence()
+        .mapNotNull { choice ->
+            val fields = listOf(
+                choice.displayPath,
+                choice.name,
+                choice.tagId,
+                choice.origin,
+            ).map(::normalizeInspectCollectionSearchText)
+                .filter(String::isNotEmpty)
+                .distinct()
+            if (!terms.all { term -> fields.any { term in it } }) return@mapNotNull null
+
+            val phraseRank = when {
+                fields.any { it == normalizedQuery } -> 0
+                fields.any { it.startsWith(normalizedQuery) } -> 1
+                fields.any { normalizedQuery in it } -> 2
+                else -> 3
+            }
+            val words = fields.flatMap { it.split(' ') }
+            val termRank = terms.fold(0) { rank, term ->
+                rank + when {
+                    words.any { it == term } -> 0
+                    words.any { it.startsWith(term) } -> 1
+                    else -> 2
+                }
+            }
+            RankedInspectCollectionChoice(choice, phraseRank, termRank)
+        }
+        .sortedWith(
+            compareBy<RankedInspectCollectionChoice> { it.phraseRank }
+                .thenBy { it.termRank }
+                .thenComparator { left, right -> alphabetic.compare(left.choice, right.choice) },
+        )
+        .take(limit)
+        .map(RankedInspectCollectionChoice::choice)
+        .toList()
+}
 
 /**
  * Render legacy frozen provenance that has no durable parent id. The physical
